@@ -1,0 +1,56 @@
+name: Build Windows Setup.exe
+
+# Runs on a real Windows runner because the app (PyQt5 GUI, WASAPI audio,
+# Windows global hotkeys) can only be compiled into a working .exe on
+# Windows itself. Builds on every push to main, and also attaches the
+# installer to a GitHub Release whenever you push a tag like "v1.0.0".
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install app + build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+
+      - name: Generate app icon
+        run: python tools/generate_icon.py
+
+      - name: Build executable with PyInstaller
+        run: pyinstaller --noconfirm build.spec
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build Setup.exe with Inno Setup
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+
+      - name: Upload Setup.exe as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartScreenRecorder-Setup
+          path: installer_output/SmartScreenRecorder-Setup.exe
+          if-no-files-found: error
+
+      - name: Attach Setup.exe to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer_output/SmartScreenRecorder-Setup.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
