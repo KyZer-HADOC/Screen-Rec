@@ -1,9 +1,8 @@
 PyQt5==5.15.10
 mss==9.0.1
-opencv-python==4.10.0.84
+opencv-python-headless==4.10.0.84
 numpy==1.26.4
 keyboard==0.13.5
 pynput==1.7.7
 PyAudioWPatch==0.2.12.7
 imageio-ffmpeg==0.5.1
-Pillow==10.4.0

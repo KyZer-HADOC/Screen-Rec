@@ -46,7 +46,9 @@ DEFAULTS = {
 
     # click visualization
     "show_clicks": True,
-    "click_color_left": [255, 60, 60],     # RGB - Blue-ish per user (kept configurable)
+    "show_cursor": True,           # mss can't capture the pointer, so we draw it
+    "cursor_scale": 1.0,
+    "click_color_left": [60, 130, 255],    # RGB - Blue
     "click_color_right": [235, 40, 40],    # Red
     "click_color_middle": [255, 220, 40],  # Yellow
     "click_fade_ms": 450,

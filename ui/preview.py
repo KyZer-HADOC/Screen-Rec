@@ -57,6 +57,11 @@ class PreviewPanel(QFrame):
         return self._sct
 
     def _tick(self):
+        # Nobody can see the preview when the window is hidden/minimised, and
+        # grabbing the screen 12x/s competes with the real recorder for CPU.
+        win = self.window()
+        if win is None or not win.isVisible() or win.isMinimized():
+            return
         try:
             region = self.recorder.get_preview_region()
         except Exception:

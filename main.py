@@ -9,6 +9,7 @@ import sys
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QApplication
 
+from core import win_power
 from core.resources import icon_path
 from ui.main_window import MainWindow
 
@@ -25,6 +26,7 @@ def main():
         except Exception:  # noqa: BLE001
             pass
 
+    win_power.disable_throttling()
     app = QApplication(sys.argv)
     app.setApplicationName("Smart Screen Recorder")
     app.setQuitOnLastWindowClosed(False)  # keep running in tray

@@ -10,6 +10,7 @@ The main recording engine. Runs the capture loop on a background thread:
 
 Also exposes a screenshot() method usable independently of recording.
 """
+import logging
 import os
 import tempfile
 import threading
@@ -23,6 +24,7 @@ import numpy as np
 from core.audio_capture import AudioCapture
 from core.input_tracker import InputTracker
 from core.muxer import mux
+from core import win_power
 from core.zoom_engine import ZoomEngine
 
 QUALITY_PRESETS = {
@@ -31,6 +33,29 @@ QUALITY_PRESETS = {
     "medium": (1920, 8),
     "high": (2560, 16),
 }
+
+
+log = logging.getLogger("ssr")
+
+
+def _setup_logging():
+    """Log to %APPDATA%/SmartScreenRecorder/log.txt so silent failures in
+    the windowed .exe (no console) can actually be diagnosed."""
+    if log.handlers:
+        return
+    try:
+        base = os.getenv("APPDATA") or os.path.expanduser("~")
+        d = os.path.join(base, "SmartScreenRecorder")
+        os.makedirs(d, exist_ok=True)
+        h = logging.FileHandler(os.path.join(d, "log.txt"), encoding="utf-8")
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        log.addHandler(h)
+        log.setLevel(logging.INFO)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_setup_logging()
 
 
 class RecordingState:
@@ -137,6 +162,12 @@ class Recorder:
             )
             self._audio.start()
 
+        self._t0 = time.perf_counter()
+        self._paused_total = 0.0
+        self._frames_due = 0
+        self._last_processed = None
+
+        win_power.begin_recording_mode()
         self.input_tracker.start()
         self.state = RecordingState.RECORDING
         self.on_status("recording_started")
@@ -189,6 +220,7 @@ class Recorder:
             self._thread.join(timeout=10)
         self.input_tracker.stop()
         self._writer.release()
+        win_power.end_recording_mode()
 
         if self._frames_written == 0:
             self.on_error(
@@ -283,29 +315,55 @@ class Recorder:
             cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, dst=frame)
         return frame
 
+    def _draw_cursor(self, frame, crop_rect, scale_x, scale_y):
+        """mss never captures the mouse pointer, so draw one ourselves at the
+        real current cursor position (white arrow with dark outline)."""
+        if not self.cfg.get("show_cursor", True):
+            return frame
+        pos = win_power.cursor_pos() or self.input_tracker.get_position()
+        cx0, cy0, cw, ch = crop_rect
+        lx = pos[0] - self._region["left"]
+        ly = pos[1] - self._region["top"]
+        if not (cx0 <= lx <= cx0 + cw and cy0 <= ly <= cy0 + ch):
+            return frame
+        px = int((lx - cx0) * scale_x)
+        py = int((ly - cy0) * scale_y)
+        k = max(0.8, min(scale_x, scale_y)) * float(self.cfg.get("cursor_scale", 1.0))
+        # classic arrow shape, tip at (0, 0)
+        arrow = np.array([(0, 0), (0, 17), (4, 13), (7, 20), (10, 19),
+                          (7, 12), (12, 12)], dtype=np.float32) * k
+        pts = (arrow + np.array([px, py], dtype=np.float32)).astype(np.int32)
+        cv2.fillPoly(frame, [pts], (255, 255, 255), lineType=cv2.LINE_AA)
+        cv2.polylines(frame, [pts], True, (0, 0, 0), thickness=max(1, int(round(k))),
+                      lineType=cv2.LINE_AA)
+        return frame
+
     def _capture_loop(self, fps: int):
+        """Crash-proof wrapper: any error is logged, the capture keeps going,
+        and the user is told if it ever has to give up."""
+        failures = 0
+        while not self._stop_flag.is_set():
+            try:
+                self._capture_loop_inner(fps)
+                return
+            except Exception as e:  # noqa: BLE001
+                failures += 1
+                log.exception("capture loop error (#%d)", failures)
+                if failures >= 20:
+                    self.on_error(f"Recording capture failed repeatedly: {e}")
+                    return
+                time.sleep(0.2)
+
+    def _capture_loop_inner(self, fps: int):
         """
         Writes frames on a strict wall-clock schedule so the saved video's
-        duration always matches the real time spent recording, regardless
-        of how long grabbing/processing each frame actually takes:
-
-          - a slow frame (e.g. big monitor + smart-zoom + resize) no longer
-            shrinks the output's reported duration - we duplicate the most
-            recently processed frame to catch up to the schedule instead of
-            just writing one frame per loop iteration.
-          - paused time is excluded from the schedule so pausing doesn't
-            change playback speed once resumed.
+        duration always matches the real time spent recording. Slow frames
+        are caught up by duplicating the last frame; paused time is excluded.
+        Timing state lives on self so the loop can resume after an error.
         """
         out_w, out_h = self._out_size
-        start_time = time.perf_counter()
-        paused_total = 0.0
-        last_tick = start_time
-        frames_due = 0          # how many frames *should* exist by now
-        last_processed = None
-        # safety cap: never duplicate more than 2 seconds worth of frames in
-        # one go (e.g. after the OS suspends the process) to avoid a huge
-        # write burst freezing the app.
         max_catchup_frames = max(int(fps * 2), 1)
+        last_tick = time.perf_counter()
 
         with mss.mss() as sct:
             while not self._stop_flag.is_set():
@@ -313,7 +371,7 @@ class Recorder:
                     pause_started = time.perf_counter()
                     while self._pause_flag.is_set() and not self._stop_flag.is_set():
                         time.sleep(0.02)
-                    paused_total += time.perf_counter() - pause_started
+                    self._paused_total += time.perf_counter() - pause_started
                     last_tick = time.perf_counter()
                     continue
 
@@ -323,41 +381,43 @@ class Recorder:
 
                 raw = sct.grab(self._region)
                 frame = np.array(raw)[:, :, :3]  # BGRA -> BGR
+                frame = np.ascontiguousarray(frame)
 
                 if self.cfg.get("smart_recording", False):
-                    cx, cy = self.input_tracker.get_position()
-                    lx = cx - self._region["left"]
-                    ly = cy - self._region["top"]
+                    pos = win_power.cursor_pos() or self.input_tracker.get_position()
+                    lx = pos[0] - self._region["left"]
+                    ly = pos[1] - self._region["top"]
                     self._zoom_engine.set_zoom_factor(self.cfg.get("zoom_factor", 2.0))
                     self._zoom_engine.set_smoothing(self.cfg.get("zoom_smoothing", 0.15))
                     x, y, w, h = self._zoom_engine.update(lx, ly, dt=dt)
-                    cropped = frame[y:y + h, x:x + w]
+                    w, h = max(w, 2), max(h, 2)
+                    cropped = np.ascontiguousarray(frame[y:y + h, x:x + w])
                     scale_x = out_w / w
                     scale_y = out_h / h
-                    cropped = self._draw_clicks(cropped, (x, y, w, h), scale_x, scale_y)
                     resized = cv2.resize(cropped, (out_w, out_h),
                                           interpolation=cv2.INTER_LINEAR)
+                    rect = (x, y, w, h)
                 else:
-                    full_rect = (0, 0, self._region["width"], self._region["height"])
                     scale_x = out_w / self._region["width"]
                     scale_y = out_h / self._region["height"]
-                    frame = self._draw_clicks(frame, full_rect, scale_x, scale_y)
                     resized = cv2.resize(frame, (out_w, out_h),
                                           interpolation=cv2.INTER_LINEAR)
+                    rect = (0, 0, self._region["width"], self._region["height"])
 
-                last_processed = resized
+                # draw on the OUTPUT-sized frame so line widths/radii stay crisp
+                resized = self._draw_clicks(resized, rect, scale_x, scale_y)
+                resized = self._draw_cursor(resized, rect, scale_x, scale_y)
+                self._last_processed = resized
 
-                elapsed = time.perf_counter() - start_time - paused_total
+                elapsed = time.perf_counter() - self._t0 - self._paused_total
                 target_frames = int(elapsed * fps) + 1
-                target_frames = min(target_frames, frames_due + max_catchup_frames)
-                while frames_due < target_frames:
-                    self._writer.write(last_processed)
+                target_frames = min(target_frames, self._frames_due + max_catchup_frames)
+                while self._frames_due < target_frames:
+                    self._writer.write(self._last_processed)
                     self._frames_written += 1
-                    frames_due += 1
+                    self._frames_due += 1
 
-                # if we're running ahead of real time (fast machine / simple
-                # capture), sleep off the remainder instead of busy-looping
-                next_due_time = start_time + paused_total + (frames_due / fps)
+                next_due_time = self._t0 + self._paused_total + (self._frames_due / fps)
                 sleep_time = next_due_time - time.perf_counter()
                 if sleep_time > 0:
                     time.sleep(min(sleep_time, 0.05))
