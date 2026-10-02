@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+dist/
+installer_output/
+*.spec.bak
+.DS_Store
+assets/icon.ico
+assets/icon.png
