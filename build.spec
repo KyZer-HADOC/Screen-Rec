@@ -15,13 +15,16 @@ a = Analysis(
         'keyboard',
         'pynput.mouse._win32',
         'pynput.keyboard._win32',
+        # numpy.random (a compiled Cython module) imports these, but
+        # PyInstaller can't see inside it, so list them explicitly.
+        'secrets', 'hmac', 'hashlib', 'base64', 'binascii',
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     # Modules the app never uses - keeping them out shrinks the build.
     excludes=[
-        'tkinter', '_tkinter', 'unittest', 'test', 'pydoc_data', 'lib2to3',
+        'tkinter', '_tkinter', 'test', 'pydoc_data', 'lib2to3',
         'matplotlib', 'scipy', 'pandas', 'PIL', 'IPython', 'pytest',
         'PyQt5.QtNetwork', 'PyQt5.QtQml', 'PyQt5.QtQuick', 'PyQt5.QtSvg',
         'PyQt5.QtWebEngine', 'PyQt5.QtWebEngineWidgets', 'PyQt5.QtWebChannel',
